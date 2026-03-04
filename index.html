@@ -4,6 +4,18 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
 <title>给你的小惊喜</title>
+<!--
+  ===== CloudBase 聊天配置区（上线前请先填写） =====
+  1) CLOUD.env: 你的云开发环境 ID（例如：xxx-123abc）
+  2) CLOUD.region: 环境地域（例如：ap-shanghai）
+  3) CLOUD.accessKey: 可选，云开发 Web 端 Publishable Key（匿名登录不可用时可配置）
+
+  控制台准备项：
+  - 登录方式：开启「匿名登录」
+  - 数据库：创建集合 messages（文档字段：roomId/sender/text/timestamp）
+  - 权限与安全：在「环境配置/安全配置」中添加站点域名（如 GitHub Pages 域名）并等待生效
+  - 访问方式：请使用 HTTPS（如 GitHub Pages 默认 https://）
+-->
 
 <style>
   :root{
@@ -532,6 +544,7 @@
     if(entry) entry.classList.remove("show");
     const chatModalEl = $("chatModal");
     if(chatModalEl) chatModalEl.classList.remove("show");
+    if (typeof window.stopRealtime === "function") window.stopRealtime();
     stopRomance();
   });
 
@@ -895,19 +908,13 @@
   }
 </script>
 
-<script type="module">
-  import { initializeApp } from "https://www.gstatic.com/firebasejs/9.23.0/firebase-app.js";
-  import { getAuth, signInAnonymously } from "https://www.gstatic.com/firebasejs/9.23.0/firebase-auth.js";
-  import { getFirestore, collection, addDoc, onSnapshot, orderBy, query, serverTimestamp } from "https://www.gstatic.com/firebasejs/9.23.0/firebase-firestore.js";
-
- const firebaseConfig = {
-  apiKey: "AIzaSyDjQC2H1FOPJoWRaWlaq6wzmcLhiSYTY8E",
-  authDomain: "birthday-surprise-chat.firebaseapp.com",
-  projectId: "birthday-surprise-chat",
-  storageBucket: "birthday-surprise-chat.appspot.com",
-  messagingSenderId: "5046979239",
-  appId: "1:5046979239:web:40a05997c107a2c395a982"
-};
+<script src="https://static.cloudbase.net/cloudbase-js-sdk/latest/cloudbase.full.js"></script>
+<script>
+  const CLOUD = {
+    env: "YOUR_ENV_ID",
+    region: "ap-shanghai",
+    accessKey: ""
+  };
 
   const params = new URLSearchParams(window.location.search);
   const roomId = (params.get("room") || "love520").trim();
@@ -922,12 +929,37 @@
   const chatInput = document.getElementById("chatInput");
 
   let hasShownHint = false;
-  let unsubscribeMessages = null;
-  let db;
+  let chatInitialized = false;
+  let app = null;
+  let db = null;
+  let watcher = null;
+  let pollingTimer = null;
+  let lastRenderedSignature = "";
 
-  function formatTime(dateLike) {
-    const date = dateLike instanceof Date ? dateLike : new Date();
-    return date.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false });
+  function getTimeValue(timestamp) {
+    if (!timestamp) return Date.now();
+    if (typeof timestamp === "number") return timestamp;
+    if (timestamp instanceof Date) return timestamp.getTime();
+    if (typeof timestamp?.toDate === "function") {
+      const date = timestamp.toDate();
+      return date instanceof Date ? date.getTime() : Date.now();
+    }
+    if (typeof timestamp?.$date === "number") return timestamp.$date;
+    if (typeof timestamp?.seconds === "number") {
+      const ms = timestamp.seconds * 1000;
+      const nano = typeof timestamp.nanoseconds === "number" ? Math.floor(timestamp.nanoseconds / 1e6) : 0;
+      return ms + nano;
+    }
+    const parsed = new Date(timestamp).getTime();
+    return Number.isFinite(parsed) ? parsed : Date.now();
+  }
+
+  function formatTime(timestamp) {
+    return new Date(getTimeValue(timestamp)).toLocaleTimeString("zh-CN", {
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: false
+    });
   }
 
   function appendMessage({ text, sender, timestamp, isSystem = false }) {
@@ -940,7 +972,7 @@
 
     const timeEl = document.createElement("div");
     timeEl.className = "chat-time";
-    timeEl.textContent = formatTime(timestamp?.toDate?.() || new Date());
+    timeEl.textContent = formatTime(timestamp);
 
     item.appendChild(bubble);
     if (!isSystem) item.appendChild(timeEl);
@@ -948,18 +980,121 @@
     chatMessages.scrollTop = chatMessages.scrollHeight;
   }
 
-  function renderMessages(snapshot) {
-    chatMessages.innerHTML = "";
-    if (!hasShownHint) {
-      appendMessage({ text: "我在呢，你想和我说什么？", isSystem: true });
-      hasShownHint = true;
-    }
+  function ensureHintMessage() {
+    if (hasShownHint) return;
+    appendMessage({ text: "我在呢，你想和我说什么？", isSystem: true });
+    hasShownHint = true;
+  }
 
-    snapshot.forEach((doc) => {
-      const data = doc.data();
-      if (!data?.text) return;
-      appendMessage({ text: data.text, sender: data.sender, timestamp: data.timestamp });
-    });
+  function normalizeDocs(docs) {
+    return (docs || [])
+      .map((doc) => (doc?.data ? doc.data : doc))
+      .filter((msg) => msg && msg.roomId === roomId && typeof msg.text === "string" && msg.text.trim())
+      .map((msg) => ({
+        text: msg.text,
+        sender: msg.sender === "me" ? "me" : "her",
+        timestamp: msg.timestamp || Date.now()
+      }))
+      .sort((a, b) => getTimeValue(a.timestamp) - getTimeValue(b.timestamp));
+  }
+
+  function renderMessages(docs) {
+    const messages = normalizeDocs(docs);
+    const signature = JSON.stringify(messages.map((m) => [m.sender, m.text, getTimeValue(m.timestamp)]));
+    if (signature === lastRenderedSignature) return;
+    lastRenderedSignature = signature;
+
+    chatMessages.innerHTML = "";
+    ensureHintMessage();
+    messages.forEach((msg) => appendMessage(msg));
+    chatMessages.scrollTop = chatMessages.scrollHeight;
+  }
+
+  function stopRealtime() {
+    if (watcher && typeof watcher.close === "function") {
+      watcher.close();
+      watcher = null;
+    }
+    if (pollingTimer) {
+      clearInterval(pollingTimer);
+      pollingTimer = null;
+    }
+  }
+  window.stopRealtime = stopRealtime;
+
+  async function fetchLatestMessages() {
+    try {
+      const res = await db.collection("messages")
+        .where({ roomId })
+        .orderBy("timestamp", "asc")
+        .limit(50)
+        .get();
+      renderMessages(res?.data || []);
+    } catch (error) {
+      console.error("[CloudBase] polling fetch failed", error);
+      appendMessage({ text: "消息拉取失败，请刷新重试。", isSystem: true });
+    }
+  }
+
+  async function startPollingMode() {
+    if (pollingTimer) return;
+    appendMessage({ text: "实时通道不可用，已切换为轮询模式", isSystem: true });
+    await fetchLatestMessages();
+    pollingTimer = setInterval(fetchLatestMessages, 2000);
+  }
+
+  async function startRealtime() {
+    stopRealtime();
+    try {
+      watcher = db.collection("messages")
+        .where({ roomId })
+        .orderBy("timestamp", "asc")
+        .watch({
+          onChange(snapshot) {
+            renderMessages(snapshot?.docs || []);
+          },
+          onError(error) {
+            console.error("[CloudBase] watch failed", error);
+            appendMessage({ text: "聊天连接失败，请刷新重试", isSystem: true });
+            startPollingMode();
+          }
+        });
+    } catch (error) {
+      console.error("[CloudBase] watch setup failed", error);
+      appendMessage({ text: "聊天连接失败，请刷新重试", isSystem: true });
+      await startPollingMode();
+    }
+  }
+
+  async function initChat() {
+    if (chatInitialized) return true;
+    try {
+      const initOptions = { env: CLOUD.env, region: CLOUD.region };
+      if (CLOUD.accessKey) initOptions.accessKey = CLOUD.accessKey;
+
+      app = cloudbase.init(initOptions);
+      const auth = typeof app.auth === "function" ? app.auth() : app.auth;
+
+      if (auth && typeof auth.signInAnonymously === "function") {
+        await auth.signInAnonymously();
+      } else {
+        throw new Error("signInAnonymously 不可用，请检查 SDK 或改用 accessKey。");
+      }
+
+      db = app.database();
+      chatInitialized = true;
+      return true;
+    } catch (error) {
+      console.error("[CloudBase] init/login failed", error);
+      appendMessage({ text: "聊天初始化失败，请在云开发控制台开启匿名登录或配置 Publishable Key。", isSystem: true });
+      return false;
+    }
+  }
+
+  async function ensureChatConnected() {
+    const ok = await initChat();
+    if (!ok) return;
+    await startRealtime();
   }
 
   async function sendMessage() {
@@ -970,45 +1105,41 @@
       return;
     }
 
-    await addDoc(collection(db, "rooms", roomId, "messages"), {
-      text,
-      sender: senderName,
-      timestamp: serverTimestamp()
-    });
-
-    chatInput.value = "";
-  }
-
-  async function initChat() {
     try {
-      const app = initializeApp(firebaseConfig);
-      const auth = getAuth(app);
-      db = getFirestore(app);
-      await signInAnonymously(auth);
-
-      const q = query(collection(db, "rooms", roomId, "messages"), orderBy("timestamp", "asc"));
-      unsubscribeMessages = onSnapshot(q, renderMessages);
+      await ensureChatConnected();
+      const payload = {
+        roomId,
+        sender: senderName,
+        text,
+        timestamp: typeof db.serverDate === "function" ? db.serverDate() : Date.now()
+      };
+      await db.collection("messages").add(payload);
+      chatInput.value = "";
     } catch (error) {
-      console.error("Firebase init failed", error);
-      appendMessage({ text: "聊天初始化失败，请稍后刷新重试。", isSystem: true });
+      console.error("[CloudBase] send failed", error);
+      appendMessage({ text: "发送失败，请稍后重试。", isSystem: true });
     }
   }
 
-  bunnyBtn?.addEventListener("click", () => {
+  bunnyBtn?.addEventListener("click", async () => {
     chatModal.classList.add("show");
     chatModal.setAttribute("aria-hidden", "false");
+    ensureHintMessage();
     chatInput.focus();
+    await ensureChatConnected();
   });
 
   chatClose?.addEventListener("click", () => {
     chatModal.classList.remove("show");
     chatModal.setAttribute("aria-hidden", "true");
+    stopRealtime();
   });
 
   chatModal?.addEventListener("click", (event) => {
     if (event.target === chatModal) {
       chatModal.classList.remove("show");
       chatModal.setAttribute("aria-hidden", "true");
+      stopRealtime();
     }
   });
 
@@ -1025,7 +1156,7 @@
   });
 
   window.addEventListener("beforeunload", () => {
-    if (typeof unsubscribeMessages === "function") unsubscribeMessages();
+    stopRealtime();
   });
 
   initChat();
